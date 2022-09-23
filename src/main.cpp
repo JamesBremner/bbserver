@@ -17,45 +17,42 @@ struct sConfig
 class cMessage
 {
     int id;
-    
+
     std::string line;
-    std::string sender;
 
 public:
     cMessage(const std::string &line);
     int write();
 
+    std::string sender;
     static int myLastID;
-};
-
-class cMessageBoard
-{
-public:
-    /// @brief Add a message
-    /// @param msg
-    /// @return message ID on success, -1 on failure
-
-    int add(cMessage &msg);
 };
 
 class cBBServer
 {
-    wex::cSocket myTCPServer;
-
 public:
     void startServer();
 
 private:
     /// @brief read last message ID from bbfile
     void setLastMsgID();
+    wex::cSocket myTCPServer;
+    std::map<std::string, std::string> myMapUser;
 
-    bool processMessage(
+    /// @brief Process a message received for writing
+    /// @param port
+    /// @param msg
+    /// @return id of message if written, -1 if success without writing msg
+    int processMessage(
         std::string &port,
         const std::string &msg);
+
+    int processCommand(
+        std::string &port,
+        const std::string &cmdmsg);
 };
 
 sConfig theConfig;
-cMessageBoard theBoard;
 cBBServer theServer;
 int cMessage::myLastID = -1;
 
@@ -75,10 +72,7 @@ int cMessage::write()
     std::cout << "wrote " << id << "\n";
     return id;
 }
-int cMessageBoard::add(cMessage &msg)
-{
-    return msg.write();
-}
+
 void commandParser(int argc, char *argv[])
 {
     raven::set::cCommandParser P;
@@ -104,9 +98,9 @@ void cBBServer::setLastMsgID()
     if (!ifs.is_open())
         return;
     std::string line;
-    while( getline(ifs,line ))
+    while (getline(ifs, line))
     {
-        if( cMessage::myLastID < atoi(line.c_str()) )
+        if (cMessage::myLastID < atoi(line.c_str()))
             cMessage::myLastID = atoi(line.c_str());
     }
 }
@@ -123,11 +117,29 @@ void cBBServer::startServer()
             [&](std::string &port)
             {
                 std::cout << "Client connected on " << port << "\n";
+                myTCPServer.send("0.0 greeting\n");
             },
             [&](std::string &port, const std::string &msg)
             {
-                if (!processMessage(port, msg))
-                    std::cout << "processMessage error \n" + msg;
+                int id = processMessage(port, msg);
+                if (id >= 0)
+                    myTCPServer.send("3.0 WROTE " + std::to_string(id));
+                else
+                {
+                    switch (id)
+                    {
+                    case -1:
+                        return;
+                    default:
+
+                        myTCPServer.send(
+                            "3.2 ERROR WRITE " +
+                            std::to_string(id) + " " +
+                            msg);
+                        std::cout << "processMessage error \n" + msg;
+                        break;
+                    }
+                }
             });
         std::cout << "Waiting for connection on port "
                   << theConfig.serverPort << "\n";
@@ -140,7 +152,7 @@ void cBBServer::startServer()
             "Cannot start server " + std::string(e.what()));
     }
 }
-bool cBBServer::processMessage(
+int cBBServer::processMessage(
     std::string &port,
     const std::string &msg)
 {
@@ -155,7 +167,7 @@ bool cBBServer::processMessage(
                 std::cout << std::hex << (int)((unsigned char)c) << " ";
             std::cout << std::endl;
             std::cout << "garbage received, ignoring it\n";
-            return false;
+            return -2;
         }
     }
 
@@ -168,50 +180,83 @@ bool cBBServer::processMessage(
         //         for (char c : msg_acc )
         //     std::cout << std::hex << (int)((unsigned char) c) << "_";
         // std::cout << "\n";
-        return true;
+        return -1;
     }
 
     for (char c : msg_acc)
         std::cout << std::hex << (int)((unsigned char)c) << "_";
     std::cout << "\n";
 
-    auto cmd = msg_acc.substr(0, 4);
+    int ret = processCommand( port, msg_acc );
+
+    msg_acc.clear();
+
+    return ret;;
+}
+
+int cBBServer::processCommand(
+    std::string &port,
+    const std::string &cmdmsg)
+{
+    auto cmd = cmdmsg.substr(0, 4);
     if (cmd == "WRIT")
     {
-        auto mraw = msg_acc.substr(6);
+        auto mraw = cmdmsg.substr(6);
         std::string mp; //  processed message
         for (char c : mraw)
         {
             if (c == '/')
             {
-                msg_acc.clear();
-                return false;
+                return -3;
             }
 
             if (c == '\n' || c == '\r')
             {
                 // write processed message line to bbfile
                 cMessage M(mp);
-                msg_acc.clear();
+                auto it = myMapUser.find(port);
+                if (it == myMapUser.end())
+                    M.sender = "nobody";
+                else
+                    M.sender = it->second;
                 return M.write();
             }
-            else
-                mp.push_back(c);
+            mp.push_back(c);
+        }
+    }
+    else if (cmd == "USER")
+    {
+        auto mraw = cmdmsg.substr(5);
+        std::string mp; //  processed message
+        for (char c : mraw)
+        {
+            if (c == '/')
+            {
+                return -3;
+            }
+
+            if (c == '\n' || c == '\r')
+            {
+                myMapUser.insert(
+                    std::make_pair(
+                        port,
+                        mp));
+                myTCPServer.send(
+                    "1.0 HELLO " + mp);
+                return -1;
+            }
+            mp.push_back(c);
         }
     }
     else
     {
         std::cout << "\nunrecognized command\n";
-        for (char c : msg)
+        for (char c : cmdmsg)
             std::cout << std::hex << (int)((unsigned char)c) << "_";
         std::cout << "\n";
-        msg_acc.clear();
-        return false;
+        return -4;
     }
-
-    msg_acc.clear();
-
-    return true;
+    return -5;
 }
 
 main(int argc, char *argv[])
