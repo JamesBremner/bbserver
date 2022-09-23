@@ -17,13 +17,15 @@ struct sConfig
 class cMessage
 {
     int id;
-    static int myLastID;
+    
     std::string line;
     std::string sender;
 
 public:
     cMessage(const std::string &line);
     int write();
+
+    static int myLastID;
 };
 
 class cMessageBoard
@@ -44,6 +46,9 @@ public:
     void startServer();
 
 private:
+    /// @brief read last message ID from bbfile
+    void setLastMsgID();
+
     bool processMessage(
         std::string &port,
         const std::string &msg);
@@ -92,8 +97,24 @@ void commandParser(int argc, char *argv[])
         theConfig.serverPort = "9000";
 }
 
+void cBBServer::setLastMsgID()
+{
+    std::ifstream ifs(
+        theConfig.bbfile);
+    if (!ifs.is_open())
+        return;
+    std::string line;
+    while( getline(ifs,line ))
+    {
+        if( cMessage::myLastID < atoi(line.c_str()) )
+            cMessage::myLastID = atoi(line.c_str());
+    }
+}
+
 void cBBServer::startServer()
 {
+    setLastMsgID();
+
     // wait for connection request
     try
     {
@@ -157,7 +178,7 @@ bool cBBServer::processMessage(
     auto cmd = msg_acc.substr(0, 4);
     if (cmd == "WRIT")
     {
-        auto mraw = msg_acc.substr(6); 
+        auto mraw = msg_acc.substr(6);
         std::string mp; //  processed message
         for (char c : mraw)
         {
