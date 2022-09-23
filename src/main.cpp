@@ -50,6 +50,9 @@ private:
     int processCommand(
         std::string &port,
         const std::string &cmdmsg);
+
+    std::string msgFind(
+        const std::string &number);
 };
 
 sConfig theConfig;
@@ -187,11 +190,12 @@ int cBBServer::processMessage(
         std::cout << std::hex << (int)((unsigned char)c) << "_";
     std::cout << "\n";
 
-    int ret = processCommand( port, msg_acc );
+    int ret = processCommand(port, msg_acc);
 
     msg_acc.clear();
 
-    return ret;;
+    return ret;
+    ;
 }
 
 int cBBServer::processCommand(
@@ -248,6 +252,26 @@ int cBBServer::processCommand(
             mp.push_back(c);
         }
     }
+    else if (cmd == "READ")
+    {
+        auto mraw = cmdmsg.substr(5);
+        std::string mp; //  processed message
+        for (char c : mraw)
+        {
+            if (c == '/')
+            {
+                return -3;
+            }
+
+            if (c == '\n' || c == '\r')
+            {
+                myTCPServer.send(
+                    msgFind(mp));
+                return -1;
+            }
+            mp.push_back(c);
+        }
+    }
     else
     {
         std::cout << "\nunrecognized command\n";
@@ -259,10 +283,30 @@ int cBBServer::processCommand(
     return -5;
 }
 
-main(int argc, char *argv[])
+std::string cBBServer::msgFind(
+    const std::string &number)
 {
-    commandParser(argc, argv);
-    theServer.startServer();
-
-    return 0;
+    int mid = atoi(number.c_str());
+    std::ifstream ifs(
+        theConfig.bbfile);
+    if (!ifs.is_open())
+        return "2.2 ERROR READ text\n";
+    std::string line;
+    while (getline(ifs, line))
+    {
+        if( atoi(line.c_str()) == mid )
+        {
+            line[ line.find("/") ] = ' ';
+            return "2.0 MESSAGE " + line + std::string("\n");
+        }
+    }
+    return "2.1 UNKNOWN " + number + "\n";
 }
+
+    main(int argc, char *argv[])
+    {
+        commandParser(argc, argv);
+        theServer.startServer();
+
+        return 0;
+    }
