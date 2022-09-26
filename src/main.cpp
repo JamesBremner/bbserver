@@ -50,6 +50,7 @@ private:
         replace,
         quit,
     };
+
     enum class eReturn
     {
         OK,
@@ -69,19 +70,19 @@ private:
         const std::string &msg);
 
     /// @brief check that all characters in message are legal
-    /// @param msg 
+    /// @param msg
     /// @return true if all OK
     bool checkLegal(
         const std::string &msg) const;
 
     /// @brief Which commans has been received
-    /// @param msg 
+    /// @param msg
     /// @return the command
     eCommand parseCommand(
         const std::string &msg) const;
 
     /// @brief what is the text following the command
-    /// @param msg 
+    /// @param msg
     /// @return text
     std::string commandText(
         const std::string &msg) const;
@@ -101,6 +102,10 @@ private:
     eReturn msgFind(
         const std::string &number,
         std::string &response);
+
+    eReturn replace(
+        std::string &port,
+        const std::string &cmdtext);
 };
 
 sConfig theConfig;
@@ -266,6 +271,8 @@ cServer::eCommand cServer::parseCommand(
         return eCommand::user;
     else if (scmd == "READ")
         return eCommand::read;
+    else if (scmd == "REPL")
+        return eCommand::replace;
     else
         return eCommand::none;
 }
@@ -286,13 +293,14 @@ int cServer::processCommand(
     std::string &port,
     const std::string &cmdmsg)
 {
-    if (!checkLegal(cmdmsg))
-        return -3;
+
     std::string cmdtext;
     switch (parseCommand(cmdmsg))
     {
     case eCommand::write:
     {
+        if (!checkLegal(cmdmsg))
+            return -3;
         cMessage M(commandText(cmdmsg.substr(6)));
         auto it = myMapUser.find(port);
         if (it == myMapUser.end())
@@ -303,6 +311,8 @@ int cServer::processCommand(
     }
 
     case eCommand::user:
+        if (!checkLegal(cmdmsg))
+            return -3;
         cmdtext = commandText(cmdmsg.substr(5));
         myMapUser.insert(
             std::make_pair(
@@ -314,10 +324,18 @@ int cServer::processCommand(
 
     case eCommand::read:
 
+        if (!checkLegal(cmdmsg))
+            return -3;
         msgFind(
             commandText(cmdmsg.substr(5)),
             cmdtext);
         myTCPServer.send(cmdtext);
+        return -1;
+
+    case eCommand::replace:
+        replace(
+            port,
+            commandText(cmdmsg.substr(8)));
         return -1;
 
     default:
@@ -328,7 +346,6 @@ int cServer::processCommand(
         std::cout << "\n";
         return -4;
     }
- 
 }
 
 cServer::eReturn cServer::msgFind(
@@ -355,6 +372,58 @@ cServer::eReturn cServer::msgFind(
     }
     response = "2.1 UNKNOWN " + number + "\n";
     return eReturn::unknown;
+}
+
+cServer::eReturn cServer::replace(
+    std::string &port,
+    const std::string &cmdtext)
+{
+    int p = cmdtext.find("/");
+    if (p == -1)
+        return eReturn::unknown;
+    auto number = cmdtext.substr(0, p);
+    auto msg = cmdtext.substr(p + 1);
+    std::vector<std::string> vbb;
+    std::ifstream ifs(theConfig.bbfile);
+    if (!ifs.is_open())
+    {
+        myTCPServer.send(
+            "3.2 ERROR WRITE " + number + "\n");
+        return eReturn::read_error;
+    }
+    std::string line;
+    bool found = false;
+    while (getline(ifs, line))
+    {
+        p = line.find("/");
+        if (number == line.substr(0, p))
+        {
+            // found matching message number
+            std::string sender("nobody");
+            auto it = myMapUser.find(port);
+            if (it != myMapUser.end())
+                sender = it->second;
+            line = number + "/" + sender + "/" + msg;
+            found = true;
+        }
+        vbb.push_back(line);
+    }
+    ifs.close();
+    if (!found)
+    {
+        myTCPServer.send(
+            "3.1 UNKNOWN " + number + "\n");
+        return eReturn::unknown;
+    }
+
+    std::ofstream ofs(theConfig.bbfile);
+    if (!ofs.is_open())
+        return eReturn::read_error;
+    for (auto &l : vbb)
+        ofs << l + "\n";
+    myTCPServer.send(
+        "3.0 WROTE " + number + "\n");
+    return eReturn::OK;
 }
 
 main(int argc, char *argv[])
