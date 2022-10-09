@@ -4,7 +4,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "starter",
+            "label": "bbserver",
             "options": {
                 "cwd": "${workspaceFolder}"
                },
@@ -12,7 +12,27 @@
             "args": [
                 "-f",
                 ".vscode/makefile",
-                "starter"
+                "bbserver"
+            ],
+
+            "problemMatcher": [
+                "$gcc"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "test",
+            "options": {
+                "cwd": "${workspaceFolder}"
+               },
+            "command": "mingw32-make.exe",
+            "args": [
+                "-f",
+                ".vscode/makefile",
+                "test"
             ],
 
             "problemMatcher": [

@@ -5,7 +5,7 @@
 #include <vector>
 #include <algorithm>
 #include <wex.h>
-#include "tcp.h"
+#include "cTCPServerMultiClient.h"
 #include "cCommandParser.h"
 
 struct sConfig
@@ -22,6 +22,9 @@ class cMessage
 
 public:
     cMessage(const std::string &line);
+
+    /// @brief read last message ID from bbfile, so new msg gets unique ID
+    static void setLastMsgID();
     int write();
 
     std::string sender;
@@ -32,13 +35,12 @@ public:
 class cServer
 {
 public:
-    cServer()
-    {
-    }
+    cServer();
+
     void startServer();
 
 private:
-    wex::cSocket myTCPServer;
+    raven::set::cTCPServerMultiClient myTCPServer;
     std::map<std::string, std::string> myMapUser;
 
     enum class eCommand
@@ -58,15 +60,22 @@ private:
         unknown,
     };
 
-    /// @brief read last message ID from bbfile, so new msg gets unique ID
-    void setLastMsgID();
+    eCommand myLastCommand;
+    int myLastID;
+    std::string myLastReplaced;
 
-    /// @brief Process a message received for writing
+    void eventHandler(
+        int client,
+        raven::set::cTCPServerMultiClient::eEvent type,
+        const std::string &msg);
+
+    /// @brief Process a message received from client
     /// @param port
     /// @param msg
     /// @return id of message if written, -1 if success without writing msg
-    int processMessage(
-        std::string &port,
+
+    std::string clientMsgProcessor(
+        int client,
         const std::string &msg);
 
     /// @brief check that all characters in message are legal
@@ -75,25 +84,13 @@ private:
     bool checkLegal(
         const std::string &msg) const;
 
-    /// @brief Which commans has been received
-    /// @param msg
+    /// @brief Which command has been received
+    /// @param[in] msg  input message
+    /// @param[out] cmdtext text of command
     /// @return the command
     eCommand parseCommand(
-        const std::string &msg) const;
-
-    /// @brief what is the text following the command
-    /// @param msg
-    /// @return text
-    std::string commandText(
-        const std::string &msg) const;
-
-    /// @brief process command from client
-    /// @param port port that received command
-    /// @param cmdmsg command ( already preprocessed )
-    /// @return >0 message ID written, -1 OK, no write, <-1 error
-    int processCommand(
-        std::string &port,
-        const std::string &cmdmsg);
+        const std::string &msg,
+        std::string &cmdtext) const;
 
     /// @brief find message in bbfile
     /// @param[in] number  ID of message
@@ -104,8 +101,12 @@ private:
         std::string &response);
 
     eReturn replace(
-        std::string &port,
+        const std::string &port,
         const std::string &cmdtext);
+
+    eReturn erase(int number);
+
+    void rollback();
 };
 
 sConfig theConfig;
@@ -148,7 +149,7 @@ void commandParser(int argc, char *argv[])
         theConfig.serverPort = "9000";
 }
 
-void cServer::setLastMsgID()
+void cMessage::setLastMsgID()
 {
     std::ifstream ifs(
         theConfig.bbfile);
@@ -162,46 +163,47 @@ void cServer::setLastMsgID()
     }
 }
 
+cServer::cServer()
+    : myLastCommand(eCommand::none)
+{
+}
+
 void cServer::startServer()
 {
-    setLastMsgID();
+    cMessage::setLastMsgID();
 
     // wait for connection request
     try
     {
-        myTCPServer.server(
-            theConfig.serverPort,
-            [&](std::string &port)
-            {
-                std::cout << "Client connected on " << port << "\n";
-                myTCPServer.send("0.0 greeting\n");
-            },
-            [&](std::string &port, const std::string &msg)
-            {
-                int id = processMessage(port, msg);
-                if (id >= 0)
-                    myTCPServer.send("3.0 WROTE " + std::to_string(id));
-                else
-                {
-                    switch (id)
-                    {
-                    case -1:
-                        return;
-                    default:
+        myTCPServer.lineAccumulator(true);
+        myTCPServer.sharedProcessingThread(true);
 
-                        myTCPServer.send(
-                            "3.2 ERROR WRITE " +
-                            std::to_string(id) + " " +
-                            msg);
-                        std::cout << "processMessage error \n" + msg;
-                        break;
-                    }
-                }
-            });
+        auto ef = std::bind(
+            &eventHandler, this,
+            std::placeholders::_1,
+            std::placeholders::_2,
+            std::placeholders::_3);
+
+        auto pf = std::bind(
+            &clientMsgProcessor, this,
+            std::placeholders::_1,
+            std::placeholders::_2);
+
+        myTCPServer.start(
+            theConfig.serverPort,
+            ef,
+            pf,
+            2);
+
         std::cout << "Waiting for connection on port "
                   << theConfig.serverPort << "\n";
 
-        myTCPServer.run();
+        /* The server is running a thread listening for client requests
+            Let it get on with things
+        */
+        while (1)
+            std::this_thread::sleep_for(
+                std::chrono::seconds(1));
     }
     catch (std::runtime_error &e)
     {
@@ -209,227 +211,243 @@ void cServer::startServer()
             "Cannot start server " + std::string(e.what()));
     }
 }
-int cServer::processMessage(
-    std::string &port,
+void cServer::eventHandler(
+    int client,
+    raven::set::cTCPServerMultiClient::eEvent type,
     const std::string &msg)
 {
-
-    static std::string msg_acc("");
-
-    for (char c : msg)
+    switch (type)
     {
-        if ((int)((unsigned char)c) == 0xFF)
-        {
-            for (char c : msg_acc)
-                std::cout << std::hex << (int)((unsigned char)c) << " ";
-            std::cout << std::endl;
-            std::cout << "garbage received, ignoring it\n";
-            return -2;
-        }
+    case raven::set::cTCPServerMultiClient::eEvent::accept:
+        myTCPServer.send("0.0 greeting\n", client);
+        break;
     }
-
-    msg_acc += msg;
-
-    if (msg.find("\n") == -1 || msg.find("\r") == -1)
-    {
-        // incomplete message received
-        std::cout << "msg_acc " << msg_acc.length() << ": " << msg_acc << "\n";
-        //         for (char c : msg_acc )
-        //     std::cout << std::hex << (int)((unsigned char) c) << "_";
-        // std::cout << "\n";
-        return -1;
-    }
-
-    for (char c : msg_acc)
-        std::cout << std::hex << (int)((unsigned char)c) << "_";
-    std::cout << "\n";
-
-    int ret = processCommand(port, msg_acc);
-
-    msg_acc.clear();
-
-    return ret;
-    ;
-}
-bool cServer::checkLegal(
-    const std::string &msg) const
-{
-    for (char c : msg)
-    {
-        if (c == '/')
-            return false;
-    }
-    return true;
-}
-cServer::eCommand cServer::parseCommand(
-    const std::string &msg) const
-{
-    auto scmd = msg.substr(0, 4);
-    if (scmd == "WRIT")
-        return eCommand::write;
-    else if (scmd == "USER")
-        return eCommand::user;
-    else if (scmd == "READ")
-        return eCommand::read;
-    else if (scmd == "REPL")
-        return eCommand::replace;
-    else
-        return eCommand::none;
-}
-std::string cServer::commandText(
-    const std::string &msg) const
-{
-    std::string ret;
-    for (char c : msg)
-    {
-        if (c == '\n' || c == '\r')
-            return ret;
-        ret.push_back(c);
-    }
-    return " ";
 }
 
-int cServer::processCommand(
-    std::string &port,
-    const std::string &cmdmsg)
+std::string cServer::clientMsgProcessor(
+    int client,
+    const std::string &msg)
 {
+    if (!checkLegal(msg))
+        return "ERROR illegal character";
 
     std::string cmdtext;
-    switch (parseCommand(cmdmsg))
+    switch (parseCommand(msg, cmdtext))
     {
     case eCommand::write:
     {
-        if (!checkLegal(cmdmsg))
-            return -3;
-        cMessage M(commandText(cmdmsg.substr(6)));
-        auto it = myMapUser.find(port);
+        cMessage M(cmdtext);
+        auto it = myMapUser.find(std::to_string(client));
         if (it == myMapUser.end())
             M.sender = "nobody";
         else
             M.sender = it->second;
-        return M.write();
+        myLastID = M.write();
+        return "3.0 WROTE " + std::to_string(myLastID);
     }
 
     case eCommand::user:
-        if (!checkLegal(cmdmsg))
-            return -3;
-        cmdtext = commandText(cmdmsg.substr(5));
         myMapUser.insert(
             std::make_pair(
-                port,
+                std::to_string(client),
                 cmdtext));
-        myTCPServer.send(
-            "1.0 HELLO " + cmdtext);
-        return -1;
+        return "1.0 HELLO " + cmdtext;
 
     case eCommand::read:
-
-        if (!checkLegal(cmdmsg))
-            return -3;
+    {
+        std::string response;
         msgFind(
-            commandText(cmdmsg.substr(5)),
-            cmdtext);
-        myTCPServer.send(cmdtext);
-        return -1;
+            cmdtext,
+            response);
+        return response;
+    }
 
     case eCommand::replace:
         replace(
-            port,
-            commandText(cmdmsg.substr(8)));
-        return -1;
+            std::to_string(client),
+            cmdtext);
+        return "";
 
     default:
-        std::cout << "\nunrecognized command\n";
-        std::cout << cmdmsg << "\n";
-        for (char c : cmdmsg)
-            std::cout << std::hex << (int)((unsigned char)c) << "_";
-        std::cout << "\n";
-        return -4;
+        return "unrecognized command";
+
     }
 }
 
-cServer::eReturn cServer::msgFind(
-    const std::string &number,
-    std::string &response)
-{
-    int mid = atoi(number.c_str());
-    std::ifstream ifs(
-        theConfig.bbfile);
-    if (!ifs.is_open())
+    bool cServer::checkLegal(
+        const std::string &msg) const
     {
-        response = "2.2 ERROR READ text\n";
-        return eReturn::read_error;
-    }
-    std::string line;
-    while (getline(ifs, line))
-    {
-        if (atoi(line.c_str()) == mid)
+        for (char c : msg)
         {
-            line[line.find("/")] = ' ';
-            response = "2.0 MESSAGE " + line + std::string("\n");
-            return eReturn::OK;
+            if (c == '/')
+                return false;
         }
+        return true;
     }
-    response = "2.1 UNKNOWN " + number + "\n";
-    return eReturn::unknown;
-}
 
-cServer::eReturn cServer::replace(
-    std::string &port,
-    const std::string &cmdtext)
-{
-    int p = cmdtext.find("/");
-    if (p == -1)
-        return eReturn::unknown;
-    auto number = cmdtext.substr(0, p);
-    auto msg = cmdtext.substr(p + 1);
-    std::vector<std::string> vbb;
-    std::ifstream ifs(theConfig.bbfile);
-    if (!ifs.is_open())
+    cServer::eCommand cServer::parseCommand(
+        const std::string &msg,
+        std::string &cmdtext) const
     {
-        myTCPServer.send(
-            "3.2 ERROR WRITE " + number + "\n");
-        return eReturn::read_error;
-    }
-    std::string line;
-    bool found = false;
-    while (getline(ifs, line))
-    {
-        p = line.find("/");
-        if (number == line.substr(0, p))
+        auto scmd = msg.substr(0, 4);
+        if (scmd == "WRIT")
         {
-            // found matching message number
-            std::string sender("nobody");
-            auto it = myMapUser.find(port);
-            if (it != myMapUser.end())
-                sender = it->second;
-            line = number + "/" + sender + "/" + msg;
-            found = true;
+            cmdtext = msg.substr(6);
+            return eCommand::write;
         }
-        vbb.push_back(line);
+        else if (scmd == "USER")
+        {
+            cmdtext = msg.substr(5);
+            return eCommand::user;
+        }
+        else if (scmd == "READ")
+        {
+            cmdtext = msg.substr(5);
+            return eCommand::read;
+        }
+        else if (scmd == "REPL")
+        {
+            cmdtext = msg.substr(8);
+            return eCommand::replace;
+        }
+        else
+            return eCommand::none;
     }
-    ifs.close();
-    if (!found)
+
+    cServer::eReturn cServer::msgFind(
+        const std::string &number,
+        std::string &response)
     {
-        myTCPServer.send(
-            "3.1 UNKNOWN " + number + "\n");
+        int mid = atoi(number.c_str());
+        std::ifstream ifs(
+            theConfig.bbfile);
+        if (!ifs.is_open())
+        {
+            response = "2.2 ERROR READ text\n";
+            return eReturn::read_error;
+        }
+        std::string line;
+        while (getline(ifs, line))
+        {
+            if (atoi(line.c_str()) == mid)
+            {
+                line[line.find("/")] = ' ';
+                response = "2.0 MESSAGE " + line + std::string("\n");
+                return eReturn::OK;
+            }
+        }
+        response = "2.1 UNKNOWN " + number + "\n";
         return eReturn::unknown;
     }
 
-    std::ofstream ofs(theConfig.bbfile);
-    if (!ofs.is_open())
-        return eReturn::read_error;
-    for (auto &l : vbb)
-        ofs << l + "\n";
-    myTCPServer.send(
-        "3.0 WROTE " + number + "\n");
-    return eReturn::OK;
-}
+    cServer::eReturn cServer::replace(
+        const std::string &port,
+        const std::string &cmdtext)
+    {
+        int p = cmdtext.find("/");
+        if (p == -1)
+            return eReturn::unknown;
+        auto number = cmdtext.substr(0, p);
+        auto msg = cmdtext.substr(p + 1);
+        std::vector<std::string> vbb;
+        std::ifstream ifs(theConfig.bbfile);
+        if (!ifs.is_open())
+        {
+            myTCPServer.send(
+                "3.2 ERROR WRITE " + number + "\n");
+            return eReturn::read_error;
+        }
+        std::string line;
+        bool found = false;
+        while (getline(ifs, line))
+        {
+            p = line.find("/");
+            if (number == line.substr(0, p))
+            {
+                // found matching message number
+                myLastReplaced = line;
+                std::string sender("nobody");
+                auto it = myMapUser.find(port);
+                if (it != myMapUser.end())
+                    sender = it->second;
+                line = number + "/" + sender + "/" + msg;
+                found = true;
+            }
+            vbb.push_back(line);
+        }
+        ifs.close();
+        if (!found)
+        {
+            myTCPServer.send(
+                "3.1 UNKNOWN " + number + "\n");
+            return eReturn::unknown;
+        }
 
-main(int argc, char *argv[])
-{
-    commandParser(argc, argv);
-    theServer.startServer();
+        std::ofstream ofs(theConfig.bbfile);
+        if (!ofs.is_open())
+            return eReturn::read_error;
+        for (auto &l : vbb)
+            ofs << l + "\n";
+        myTCPServer.send(
+            "3.0 WROTE " + number + "\n");
+        myLastCommand = eCommand::replace;
+        myLastID = atoi(number.c_str());
+        return eReturn::OK;
+    }
 
-    return 0;
-}
+    cServer::eReturn cServer::erase(int number)
+    {
+        auto snumber = std::to_string(number);
+        std::vector<std::string> vbb;
+        std::ifstream ifs(theConfig.bbfile);
+        if (!ifs.is_open())
+        {
+            myTCPServer.send(
+                "3.2 ERROR WRITE " + std::to_string(number) + "\n");
+            return eReturn::read_error;
+        }
+        std::string line;
+        while (getline(ifs, line))
+        {
+            if (snumber != line.substr(0, line.find("/")))
+                vbb.push_back(line);
+        }
+        ifs.close();
+        std::ofstream ofs(theConfig.bbfile);
+        if (!ofs.is_open())
+            return eReturn::read_error;
+        for (auto &l : vbb)
+            ofs << l + "\n";
+
+        return eReturn::OK;
+    }
+    void cServer::rollback()
+    {
+        switch (myLastCommand)
+        {
+        case eCommand::write:
+            erase(myLastID);
+            break;
+        case eCommand::replace:
+            erase(myLastID);
+
+            break;
+        default:
+            break;
+        }
+    }
+
+    main(int argc, char *argv[])
+    {
+        try
+        {
+            commandParser(argc, argv);
+            theServer.startServer();
+        }
+        catch (std::runtime_error &e)
+        {
+            std::cout << "runtime error: " << e.what() << "\n";
+            return 1;
+        }
+        return 0;
+    }
